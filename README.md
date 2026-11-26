@@ -30,7 +30,13 @@ The poster was rendered from the day's `stories.json` with
 `main.ts` (Node 22, no dependencies) validates the PNG — signature,
 chunk structure, 1024×1024 dimensions, size under 1 MiB — then copies
 it unchanged to the output directory and reads it back to prove the
-copy is identical. Running it twice writes the same bytes.
+copy is identical. Running it twice writes the same bytes. It also
+verifies the CRC32 of every PNG chunk: the program builds its own
+CRC32 table (IEEE 802.3, polynomial `0xedb88320`), recomputes the
+checksum over each chunk's type + data, and compares it with the CRC
+stored after the chunk — a single flipped byte anywhere in the file
+fails the run with `error: CRC32 mismatch in <TYPE> chunk` and exit 1,
+so a corrupted poster can never be copied out as if it were valid.
 
 ## Sources
 

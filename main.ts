@@ -1,106 +1,132 @@
-// World News — 26 November 2026 (make.fun news-image-20261126).
-//
-// The poster is pre-rendered from stories.json by generate.py and stored
-// in this repo as entry.png. This program does NOT draw anything: it
-// validates the PNG, then copies its bytes unchanged to the output
-// directory and reads them back to prove the copy is identical.
-//
-// Usage:
-//   MAKEFUN_OUTPUT_DIR=/output node main.ts
-//   (default output dir is /output; the file is written as entry.png)
-
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const MAX_BYTES = 1024 * 1024; // competition limit: at most 1 MiB
-const PNG_MAGIC = Buffer.from([
+// CRC32 (IEEE 802.3, polynomial 0xedb88320) over a chunk's type + data.
+// The table is built here at startup so no dependency is needed.
+const CRC_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
 ]);
+const MAX_SIZE = 1048576; // 1 MiB
+const EXPECTED_WIDTH = 1024;
+const EXPECTED_HEIGHT = 1024;
 
 function fail(message: string): never {
   console.error(`error: ${message}`);
   process.exit(1);
 }
 
-function readChunkType(buf: Buffer, offset: number): string {
-  return buf.toString("latin1", offset + 4, offset + 8);
+const here = dirname(fileURLToPath(import.meta.url));
+const inputPath = join(here, "entry.png");
+
+let png: Buffer;
+try {
+  png = readFileSync(inputPath);
+} catch {
+  fail(`cannot read entry.png at ${inputPath}`);
 }
 
-function main(): void {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const sourcePath = join(here, "entry.png");
-  const outDir = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? "/output");
-  const outPath = join(outDir, "entry.png");
+if (png.length > MAX_SIZE) {
+  fail(`entry.png is ${png.length} bytes, over the 1048576 byte limit`);
+}
 
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(sourcePath);
-  } catch {
-    fail(`cannot read ${sourcePath}`);
+if (png.length < 8 || !png.subarray(0, 8).equals(PNG_SIGNATURE)) {
+  fail("entry.png does not start with the PNG signature");
+}
+
+// Walk the chunk chain, checking every chunk's CRC32 against the
+// value stored after its data, and that chunks join up exactly.
+let offset = 8;
+let first = true;
+let lastType = "";
+let lastDataLength = -1;
+let width = 0;
+let height = 0;
+
+while (true) {
+  if (offset + 8 > png.length) {
+    fail("truncated PNG: chunk header runs past end of file");
   }
-
-  // 1. File size: the competition caps the poster at 1 MiB.
-  const size = statSync(sourcePath).size;
-  if (size !== bytes.length) fail("stat size does not match bytes read");
-  if (size > MAX_BYTES) {
-    fail(`entry.png is ${size} bytes, over the 1 MiB limit`);
+  const dataLength = png.readUInt32BE(offset);
+  const type = png.toString("ascii", offset + 4, offset + 8);
+  const dataStart = offset + 8;
+  const dataEnd = dataStart + dataLength;
+  if (dataEnd + 4 > png.length) {
+    fail(`truncated PNG: ${type} chunk data runs past end of file`);
   }
-
-  // 2. PNG signature (first 8 bytes).
-  if (!bytes.subarray(0, 8).equals(PNG_MAGIC)) {
-    fail("entry.png does not start with the PNG signature");
+  const storedCrc = png.readUInt32BE(dataEnd);
+  const actualCrc = crc32(png.subarray(offset + 4, dataEnd));
+  if (storedCrc !== actualCrc) {
+    fail(
+      `CRC32 mismatch in ${type} chunk (stored ${storedCrc.toString(16)}, computed ${actualCrc.toString(16)})`,
+    );
   }
-
-  // 3. Walk the chunk structure: first chunk must be IHDR (13 bytes of
-  // data), chunks must chain exactly to the end, and the last one must
-  // be IEND with zero data length. This catches truncated or appended
-  // files that a first/last-chunk check alone would miss.
-  let offset = 8;
-  let seenIHDR = false;
-  let seenIEND = false;
-  while (offset + 8 <= bytes.length) {
-    const length = bytes.readUInt32BE(offset);
-    const type = readChunkType(bytes, offset);
-    if (offset + 12 + length > bytes.length) {
-      fail(`chunk ${type} at offset ${offset} runs past end of file`);
+  if (first) {
+    if (type !== "IHDR" || dataLength !== 13) {
+      fail("first chunk must be IHDR with 13 bytes of data");
     }
-    if (!seenIHDR) {
-      if (type !== "IHDR" || length !== 13) {
-        fail("first PNG chunk is not a 13-byte IHDR");
-      }
-      seenIHDR = true;
-    }
-    if (type === "IEND") {
-      if (length !== 0) fail("IEND chunk must have zero data length");
-      if (offset + 12 !== bytes.length) {
-        fail("trailing bytes after IEND");
-      }
-      seenIEND = true;
-      break;
-    }
-    offset += 12 + length;
+    width = png.readUInt32BE(dataStart);
+    height = png.readUInt32BE(dataStart + 4);
+    first = false;
   }
-  if (!seenIHDR) fail("no IHDR chunk found");
-  if (!seenIEND) fail("no IEND chunk found; file looks truncated");
-  const width = bytes.readUInt32BE(16);
-  const height = bytes.readUInt32BE(20);
-  if (width !== 1024 || height !== 1024) {
-    fail(`poster is ${width}x${height}, expected 1024x1024`);
-  }
+  lastType = type;
+  lastDataLength = dataLength;
+  offset = dataEnd + 4;
+  if (type === "IEND") break;
+}
 
-  // 4. Copy the bytes unchanged and verify the copy by reading it back.
+if (lastType !== "IEND") {
+  fail("PNG does not end with an IEND chunk");
+}
+if (lastDataLength !== 0) {
+  fail("IEND chunk must have 0 bytes of data");
+}
+if (offset !== png.length) {
+  fail("trailing bytes after IEND chunk");
+}
+if (width !== EXPECTED_WIDTH || height !== EXPECTED_HEIGHT) {
+  fail(`entry.png is ${width}x${height}, expected 1024x1024`);
+}
+
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+const outPath = join(outDir, "entry.png");
+try {
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(outPath, bytes);
-  const back = readFileSync(outPath);
-  if (!back.equals(bytes)) {
-    fail("read-back of the written file differs from entry.png");
-  }
-
-  console.log(
-    `ok: entry.png ${width}x${height}, ${size} bytes, ` +
-      `copied unchanged to ${outPath} (verified by read-back)`,
-  );
+  writeFileSync(outPath, png);
+} catch (err) {
+  fail(`cannot write ${outPath}: ${(err as Error).message}`);
 }
 
-main();
+let back: Buffer;
+try {
+  back = readFileSync(outPath);
+} catch {
+  fail(`cannot read back ${outPath}`);
+}
+if (!back.equals(png)) {
+  fail(`${outPath} differs from entry.png after copy`);
+}
+
+console.log(
+  `ok: entry.png 1024x1024, ${png.length} bytes, copied unchanged to ${outPath} (verified by read-back)`,
+);
